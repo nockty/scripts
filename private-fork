@@ -1,0 +1,94 @@
+#!/bin/bash
+#
+# Steps & commands come from https://gist.github.com/0xjac/85097472043b697ab57ba1b1c7530274
+#
+# AFAIK, there is no straightforward way to create a private fork from the github UI.
+# Hence this script.
+#
+# Usage:
+# $ private-fork owner repo
+
+# nockty is me!
+user="nockty"
+
+script_name=$(basename $0)
+
+usage()
+{
+    cat << EOF >&2
+usage: ${script_name} owner repository
+EOF
+}
+
+if [ $# -ne 2 ]; then
+    usage
+    exit 2
+fi
+
+# 1. Create a bare clone of the repository.
+
+echo "Creating a bare clone of $1/$2..."
+git clone --bare git@github.com:$1/$2.git
+
+# 2. Create a new private repository on Github
+
+echo "Go create a new private repository on Github and name it $2: https://github.com/new"
+echo "Press any key to continue"
+while [ true ] ; do
+  read -t 20 -n 1
+  if [ $? = 0 ] ; then
+    break ;
+  else
+    echo "  waiting for the keypress..."
+  fi
+done
+
+# 3. Mirror-push the bare clone to the new repository.
+
+echo "Mirror-pushing the bare clone to the new repository..."
+cd $2.git
+git push --mirror git@github.com:$user/$2.git
+
+# 4. Remove the temporary local repository created in step 1.
+
+echo "Cleaning up the temporary local bare clone..."
+cd ..
+rm -rf $2.git
+
+# 4.5 (personal addition) Re-configure main branch on github (put it to master, main, etc.) because it is often screwed
+# up at this point -- the default one seems to be the first in alphabetical order.
+
+echo "Go to https://github.com/$user/$2 and re-configure main branch"
+echo "Press any key to continue"
+while [ true ] ; do
+  read -t 20 -n 1
+  if [ $? = 0 ] ; then
+    break ;
+  else
+    echo "  waiting for the keypress..."
+  fi
+done
+
+# 5. Clone fork
+
+echo "Cloning $user/$2..."
+git clone git@github.com:$user/$2.git
+
+# 6. Add the original repo as remote to fetch (potential) future changes.
+# Make sure to also disable push on the remote (as you are most likely not allowed to push to it anyway).
+
+echo "Adding original repository as remote..."
+cd $2
+git remote add upstream git@github.com:$1/$2.git
+git remote set-url --push upstream DISABLE
+
+echo -e "Listing all remotes...\n"
+git remote -v
+echo -e "\nWhen you push, do so on origin with git push origin."
+echo "When you want to pull changes from upstream you can just fetch the remote and rebase on top of your work."
+echo "  - $ git fetch upstream"
+echo "  - $ git rebase upstream/master"
+echo "And solve the conflicts if any."
+
+echo -e "\nHappy coding! :)"
+

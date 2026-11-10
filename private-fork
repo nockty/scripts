@@ -2,16 +2,25 @@
 #
 # Steps & commands come from https://gist.github.com/0xjac/85097472043b697ab57ba1b1c7530274
 #
-# AFAIK, there is no straightforward way to create a private fork from the github UI.
-# Hence this script.
+# GitHub can't fork into a private repository, so this creates a fresh private repository
+# and mirror-pushes the upstream into it. Since the result is not a GitHub fork, GitHub
+# treats the copied .github/ directory as the repository's own: workflows run and Dependabot
+# opens PRs. This script turns both off before anything is pushed.
+#
+# An authenticated `gh` is optional. When it works, the script creates the repository and
+# changes its settings itself (this needs a classic token with the `repo` scope, or a
+# fine-grained one with Administration: write on all repositories). When it is missing,
+# logged out or lacks the permission, the script asks the user to do that step in the web UI.
 #
 # Usage:
 # $ private-fork owner repo
 
+set -euo pipefail
+
 # nockty is me!
 user="nockty"
 
-script_name=$(basename $0)
+script_name=$(basename "$0")
 
 usage()
 {
@@ -20,66 +29,115 @@ usage: ${script_name} owner repository
 EOF
 }
 
+wait_for_keypress()
+{
+    echo "Press any key to continue"
+    while true; do
+        if read -r -s -t 20 -n 1; then
+            break
+        fi
+        echo "  waiting for the keypress..."
+    done
+}
+
 if [ $# -ne 2 ]; then
     usage
     exit 2
 fi
 
+owner=$1
+repo=$2
+bare="$PWD/$repo.git"
+tmp_worktree="$PWD/$repo.private-fork-tmp"
+fork_url="git@github.com:$user/$repo.git"
+settings_url="https://github.com/$user/$repo/settings"
+
+if command -v gh > /dev/null && gh auth status > /dev/null 2>&1; then
+    use_gh=true
+else
+    use_gh=false
+    echo "gh is not installed or not logged in: GitHub-side steps will be manual."
+fi
+
 # 1. Create a bare clone of the repository.
 
-echo "Creating a bare clone of $1/$2..."
-git clone --bare git@github.com:$1/$2.git
+echo "Creating a bare clone of $owner/$repo..."
+git clone --bare "git@github.com:$owner/$repo.git" "$bare"
+default_branch=$(git -C "$bare" symbolic-ref --short HEAD)
 
-# 2. Create a new private repository on Github
+# 2. Remove the Dependabot config from the default branch, the only branch Dependabot
+# reads. There is no repository setting that turns off version updates: the file is the
+# switch. The commit sits on top of upstream, like any of our own commits.
 
-echo "Go create a new private repository on Github and name it $2: https://github.com/new"
-echo "Press any key to continue"
-while [ true ] ; do
-  read -t 20 -n 1
-  if [ $? = 0 ] ; then
-    break ;
-  else
-    echo "  waiting for the keypress..."
-  fi
-done
+git -C "$bare" worktree add --quiet "$tmp_worktree" "$default_branch"
+dependabot_files=$(git -C "$tmp_worktree" ls-files .github/dependabot.yml .github/dependabot.yaml)
+if [ -n "$dependabot_files" ]; then
+    echo "Removing the Dependabot config from $default_branch..."
+    git -C "$tmp_worktree" rm --quiet $dependabot_files
+    git -C "$tmp_worktree" commit --quiet -m "Disable Dependabot in private fork"
+fi
+git -C "$bare" worktree remove "$tmp_worktree"
 
-# 3. Mirror-push the bare clone to the new repository.
+# 3. Create the private repository.
 
-echo "Mirror-pushing the bare clone to the new repository..."
-cd $2.git
-git push --mirror git@github.com:$user/$2.git
+echo "Creating $user/$repo (private)..."
+if ! { $use_gh && gh repo create "$user/$repo" --private --disable-wiki --description "Private fork of $owner/$repo"; }; then
+    echo "Go create a new private repository named $repo: https://github.com/new"
+    echo "Leave it empty: no README, .gitignore or license."
+    wait_for_keypress
+fi
 
-# 4. Remove the temporary local repository created in step 1.
+# 4. Turn off Actions and Dependabot security updates before the first push, so no
+# workflow ever runs on the repository.
+
+echo "Disabling GitHub Actions on $user/$repo..."
+if ! { $use_gh && gh api --silent -X PUT "repos/$user/$repo/actions/permissions" -F enabled=false; }; then
+    echo "Go to $settings_url/actions and pick Settings → Actions → General → Disable actions, then Save."
+    wait_for_keypress
+fi
+
+echo "Disabling Dependabot alerts and security updates on $user/$repo..."
+if ! { $use_gh \
+    && gh api --silent -X DELETE "repos/$user/$repo/automated-security-fixes" \
+    && gh api --silent -X DELETE "repos/$user/$repo/vulnerability-alerts"; }; then
+    echo "Go to $settings_url/security_analysis and disable Dependabot alerts and Dependabot"
+    echo "security updates if they are enabled (they are off by default on private repositories)."
+    wait_for_keypress
+fi
+
+# 5. Push the default branch first (the first branch pushed to an empty repository becomes
+# its default), then mirror-push everything else.
+
+echo "Pushing $default_branch, then mirror-pushing the rest..."
+git -C "$bare" push --quiet "$fork_url" "$default_branch"
+git -C "$bare" push --mirror "$fork_url"
+
+if $use_gh; then
+    gh repo edit "$user/$repo" --default-branch "$default_branch" > /dev/null || true
+fi
+remote_default=$(git ls-remote --symref "$fork_url" HEAD | awk '$1 == "ref:" { sub("^refs/heads/", "", $2); print $2 }')
+if [ "$remote_default" != "$default_branch" ]; then
+    echo "The default branch of $user/$repo is '$remote_default', not '$default_branch'."
+    echo "Go to $settings_url and switch the default branch to $default_branch."
+    wait_for_keypress
+fi
+
+# 6. Remove the temporary local bare clone.
 
 echo "Cleaning up the temporary local bare clone..."
-cd ..
-rm -rf $2.git
+rm -rf "$bare"
 
-# 4.5 (personal addition) Re-configure main branch on github (put it to master, main, etc.) because it is often screwed
-# up at this point -- the default one seems to be the first in alphabetical order.
+# 7. Clone the fork.
 
-echo "Go to https://github.com/$user/$2 and re-configure main branch"
-echo "Press any key to continue"
-while [ true ] ; do
-  read -t 20 -n 1
-  if [ $? = 0 ] ; then
-    break ;
-  else
-    echo "  waiting for the keypress..."
-  fi
-done
+echo "Cloning $user/$repo..."
+git clone "$fork_url"
 
-# 5. Clone fork
-
-echo "Cloning $user/$2..."
-git clone git@github.com:$user/$2.git
-
-# 6. Add the original repo as remote to fetch (potential) future changes.
-# Make sure to also disable push on the remote (as you are most likely not allowed to push to it anyway).
+# 8. Add the original repo as remote to fetch future changes.
+# Make sure to also disable push on the remote (as the user is most likely not allowed to push to it anyway).
 
 echo "Adding original repository as remote..."
-cd $2
-git remote add upstream git@github.com:$1/$2.git
+cd "$repo"
+git remote add upstream "git@github.com:$owner/$repo.git"
 git remote set-url --push upstream DISABLE
 
 echo -e "Listing all remotes...\n"
@@ -87,8 +145,7 @@ git remote -v
 echo -e "\nWhen you push, do so on origin with git push origin."
 echo "When you want to pull changes from upstream you can just fetch the remote and rebase on top of your work."
 echo "  - $ git fetch upstream"
-echo "  - $ git rebase upstream/master"
+echo "  - $ git rebase upstream/$default_branch"
 echo "And solve the conflicts if any."
 
 echo -e "\nHappy coding! :)"
-
